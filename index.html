@@ -102,9 +102,9 @@ textarea{min-height:7rem;resize:vertical;line-height:1.4}
       <div class="help">Регистрация и ключ: <a href="https://console.deepgram.com" target="_blank" rel="noopener">console.deepgram.com</a></div>
     </div>
     <div>
-      <label for="anKey">Anthropic API ключ (превод)</label>
-      <input id="anKey" type="password" autocomplete="off" spellcheck="false">
-      <div class="help">Ключ и кредит: <a href="https://console.anthropic.com" target="_blank" rel="noopener">console.anthropic.com</a></div>
+      <label for="gmKey">Gemini API ключ (превод, безплатен)</label>
+      <input id="gmKey" type="password" autocomplete="off" spellcheck="false">
+      <div class="help">Безплатен ключ, без карта: <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>. В Chrome на компютър преводът работи и без него, но по-грубо.</div>
     </div>
     <div>
       <label for="mode">Режим</label>
@@ -135,8 +135,9 @@ textarea{min-height:7rem;resize:vertical;line-height:1.4}
   const $ = id => document.getElementById(id);
   const SR = 16000;
   const DG_URL = 'wss://api.deepgram.com/v1/listen?model=nova-3&language=en&smart_format=true&punctuate=true&interim_results=true&endpointing=300&utterance_end_ms=1200&encoding=linear16&sample_rate='+SR+'&channels=1';
-  const FAST_MODEL = 'claude-haiku-4-5-20251001';
-  const PRECISE_MODEL = 'claude-sonnet-5-5';
+  const FAST_MODEL = 'gemini-3.5-flash-lite';
+  const PRECISE_MODEL = 'gemini-3.8-flash';
+  const GM_URL = 'https://generativelanguage.googleapis.com/v1beta/interactions';
 
   // ---------- settings ----------
   const settings = {
@@ -144,12 +145,12 @@ textarea{min-height:7rem;resize:vertical;line-height:1.4}
     save(s){ try{ localStorage.setItem('lt-settings', JSON.stringify(s)); }catch{} }
   };
   let cfg = settings.load();
-  function fillForm(){ $('dgKey').value=cfg.dgKey||''; $('anKey').value=cfg.anKey||''; $('mode').value=cfg.mode||'precise'; $('glossary').value=cfg.glossary||''; }
+  function fillForm(){ $('dgKey').value=cfg.dgKey||''; $('gmKey').value=cfg.gmKey||''; $('mode').value=cfg.mode||'precise'; $('glossary').value=cfg.glossary||''; }
   fillForm();
   $('openSettings').onclick = () => { fillForm(); $('panel').classList.add('open'); $('dgKey').focus(); };
   $('panel').addEventListener('click', e => { if(e.target===$('panel')) $('panel').classList.remove('open'); });
   $('saveSettings').onclick = () => {
-    cfg = { dgKey:$('dgKey').value.trim(), anKey:$('anKey').value.trim(), mode:$('mode').value, glossary:$('glossary').value.trim() };
+    cfg = { dgKey:$('dgKey').value.trim(), gmKey:$('gmKey').value.trim(), mode:$('mode').value, glossary:$('glossary').value.trim() };
     settings.save(cfg); $('panel').classList.remove('open'); setMsg('');
   };
   if(!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia){
@@ -180,15 +181,42 @@ textarea{min-height:7rem;resize:vertical;line-height:1.4}
   }
 
   // ---------- translation ----------
-  async function claude(model, system, user, maxTokens){
-    const r = await fetch('https://api.anthropic.com/v1/messages',{
+  const cool={};             // model -> time until which it is skipped after hitting the free quota
+  let thinkOk=true;
+  async function gemini(model, system, user, maxTokens){
+    if(!cfg.gmKey) throw new Error('Няма Gemini ключ.');
+    if(cool[model]>Date.now()) throw new Error('Gemini: изчакване заради лимита.');
+    const gen={max_output_tokens:maxTokens, temperature:0.2};
+    const think = thinkOk && model===PRECISE_MODEL;
+    if(think) gen.thinking_level='low';
+    const r = await fetch(GM_URL,{
       method:'POST',
-      headers:{'content-type':'application/json','x-api-key':cfg.anKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
-      body:JSON.stringify({model, max_tokens:maxTokens, system, messages:[{role:'user',content:user}]})
+      headers:{'content-type':'application/json','x-goog-api-key':cfg.gmKey},
+      body:JSON.stringify({model, system_instruction:system, input:user, generation_config:gen, store:false})
     });
-    if(!r.ok){ const t=await r.text(); throw new Error('Anthropic '+r.status+': '+t.slice(0,160)); }
+    if(r.status===400 && think){ thinkOk=false; return gemini(model, system, user, maxTokens); }
+    if(r.status===429){ cool[model]=Date.now()+30000; setMsg('Безплатният лимит на Gemini е достигнат за момента. Преводът продължава с наличното.'); }
+    if(!r.ok){ const t=await r.text(); throw new Error('Gemini '+r.status+': '+t.slice(0,160)); }
     const d=await r.json();
-    return (d.content||[]).filter(b=>b.type==='text').map(b=>b.text).join('').trim();
+    let out=d.output_text||'';
+    if(!out) for(const st of (d.steps||d.outputs||[])){
+      if(st.type==='thought') continue;
+      if(typeof st.text==='string') out+=st.text;
+      if(Array.isArray(st.content)) for(const c of st.content) if(c && c.type==='text' && c.text) out+=c.text;
+    }
+    out=out.trim();
+    if(!out) throw new Error('Gemini не върна превод.');
+    return out;
+  }
+  // Chrome's on-device translator: free, no key, desktop Chrome only
+  let local=null;
+  async function initLocal(){
+    if(local || !('Translator' in self)) return;
+    try{
+      const o={sourceLanguage:'en',targetLanguage:'bg'};
+      if(await Translator.availability(o)==='unavailable') return;
+      local=await Translator.create(o);
+    }catch{}
   }
   function systemPrompt(){
     return `You are a professional simultaneous interpreter translating spoken English into natural, precise Bulgarian for an IT professional in a work meeting.
@@ -208,7 +236,12 @@ ${cfg.glossary ? '\nGlossary and instructions from the user (follow strictly):\n
 
   async function draft(entry){
     try{
-      const bg = await claude(FAST_MODEL, systemPrompt(), contextBlock()+'Translate this line:\n'+entry.en, 400);
+      let bg;
+      // in precise mode the local draft saves quota for the refine pass
+      if(local && (cfg.mode==='precise' || !cfg.gmKey)) bg = await local.translate(entry.en);
+      else try{ bg = await gemini(FAST_MODEL, systemPrompt(), contextBlock()+'Translate this line:\n'+entry.en, 1000); }
+      catch(e){ if(!local) throw e; bg = await local.translate(entry.en); }
+      if(entry.final) return;
       if(!entry.el.isConnected) return;
       entry.bg=bg; entry.el.querySelector('.bg').textContent=bg;
       entry.el.classList.remove('pending'); entry.el.classList.add('draft');
@@ -219,14 +252,17 @@ ${cfg.glossary ? '\nGlossary and instructions from the user (follow strictly):\n
   async function refine(entries){
     if(!entries.length) return;
     const en = entries.map(e=>e.en).join(' ');
-    if(cfg.mode!=='precise'){ entries.forEach(e=>{ e.el.classList.remove('draft'); pushHistory(e.en,e.bg); }); return; }
+    if(cfg.mode!=='precise' || !cfg.gmKey){ entries.forEach(e=>{ e.el.classList.remove('draft'); pushHistory(e.en,e.bg); }); return; }
     // merge into a single entry
     const first=entries[0];
     entries.slice(1).forEach(e=>e.el.remove());
     first.en=en; first.el.querySelector('.en').textContent=en;
     try{
-      const bg = await claude(PRECISE_MODEL, systemPrompt(), contextBlock()+'Translate this complete utterance with full precision:\n'+en, 800);
-      first.bg=bg; first.el.querySelector('.bg').textContent=bg;
+      const ctx=contextBlock()+'Translate this complete utterance with full precision:\n'+en;
+      let bg;
+      try{ bg = await gemini(PRECISE_MODEL, systemPrompt(), ctx, 2000); }
+      catch{ bg = await gemini(FAST_MODEL, systemPrompt(), ctx, 1000); }
+      first.final=true; first.bg=bg; first.el.querySelector('.bg').textContent=bg;
       first.el.classList.remove('draft','pending');
       pushHistory(en,bg); scrollDown();
     }catch(e){ first.el.classList.remove('draft'); pushHistory(en, first.bg); }
@@ -268,7 +304,8 @@ ${cfg.glossary ? '\nGlossary and instructions from the user (follow strictly):\n
 
   async function start(mode){
     if(running) return;
-    if(!cfg.dgKey || !cfg.anKey){ setMsg('Първо въведи двата ключа в настройките.'); $('openSettings').click(); return; }
+    if(!cfg.dgKey || (!cfg.gmKey && !('Translator' in self))){ setMsg('Първо въведи двата ключа в настройките.'); $('openSettings').click(); return; }
+    initLocal();
     setMsg(''); setStatus('Свързване…', false);
     try{
       if(mode==='mic'||mode==='both') streams.push(await getMic());
